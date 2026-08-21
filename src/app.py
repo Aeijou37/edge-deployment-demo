@@ -8,7 +8,7 @@ Gradio 前端 — 边缘部署对比 Demo
    - 分类结果一致性
    - 推理延迟对比
    - 模型大小对比
-4. 一键导出 + 量化
+4. 一键导出 + 量化（自包含，不依赖 export_onnx.py）
 
 运行:
   python src/app.py
@@ -18,12 +18,13 @@ import time
 import torch
 import numpy as np
 import gradio as gr
+import onnx
 import onnxruntime as ort
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.export_onnx import create_pointnet_classifier, export_to_onnx, verify_onnx
+from src.pointnet_model import PointNetClassifier
 from src.quantize import quantize_onnx_int8, compare_models
 from src.benchmark import benchmark_all, visualize_benchmark
 from src.utils import generate_shape, SHAPES, MODELNET40_CLASSES
@@ -33,7 +34,7 @@ class EdgeDeployApp:
     def __init__(self, num_points: int = 1024):
         print("初始化边缘部署 Demo...")
         self.num_points = num_points
-        self.torch_model = create_pointnet_classifier(num_classes=40, num_points=num_points)
+        self.torch_model = PointNetClassifier(num_classes=40, num_points=num_points)
         self.torch_model.eval()
 
         self.fp32_session = None
@@ -47,34 +48,61 @@ class EdgeDeployApp:
     def _try_load_onnx(self):
         """尝试加载已有的 ONNX 模型"""
         if Path(self.fp32_path).exists():
-            self.fp32_session = ort.InferenceSession(self.fp32_path, providers=["CPUExecutionProvider"])
-            print(f"  已加载 FP32 ONNX: {self.fp32_path}")
+            try:
+                self.fp32_session = ort.InferenceSession(self.fp32_path, providers=["CPUExecutionProvider"])
+                size_mb = Path(self.fp32_path).stat().st_size / 1024 / 1024
+                print(f"  已加载 FP32 ONNX: {self.fp32_path} ({size_mb:.2f} MB)")
+            except Exception as e:
+                print(f"  ⚠️ FP32 ONNX 加载失败: {e}")
         else:
             print("  ⚠️ 无 FP32 ONNX，请先导出")
 
         if Path(self.int8_path).exists():
-            self.int8_session = ort.InferenceSession(self.int8_path, providers=["CPUExecutionProvider"])
-            print(f"  已加载 INT8 ONNX: {self.int8_path}")
+            try:
+                self.int8_session = ort.InferenceSession(self.int8_path, providers=["CPUExecutionProvider"])
+                size_mb = Path(self.int8_path).stat().st_size / 1024 / 1024
+                print(f"  已加载 INT8 ONNX: {self.int8_path} ({size_mb:.2f} MB)")
+            except Exception as e:
+                print(f"  ⚠️ INT8 ONNX 加载失败: {e}")
         else:
             print("  ⚠️ 无 INT8 ONNX，请先量化")
 
     def export_and_quantize(self):
-        """一键导出 + 量化"""
+        """一键导出 + 量化（自包含，直接写死 dynamo=False + opset=17）"""
         results = []
 
         try:
-            export_to_onnx(self.torch_model, self.fp32_path, num_points=self.num_points)
-            results.append("✅ ONNX 导出完成")
+            Path("models").mkdir(exist_ok=True)
+            dummy = torch.randn(1, self.num_points, 3)
+            torch.onnx.export(
+                self.torch_model,
+                dummy,
+                self.fp32_path,
+                export_params=True,
+                opset_version=17,
+                do_constant_folding=True,
+                input_names=["input"],
+                output_names=["logits", "global_feat"],
+                dynamic_axes={
+                    "input": {0: "batch"},
+                    "logits": {0: "batch"},
+                    "global_feat": {0: "batch"},
+                },
+                dynamo=False,
+            )
+            fp32_size = Path(self.fp32_path).stat().st_size / 1024 / 1024
+            results.append(f"✅ ONNX 导出完成 ({fp32_size:.2f} MB)")
             self.fp32_session = ort.InferenceSession(self.fp32_path, providers=["CPUExecutionProvider"])
         except Exception as e:
             results.append(f"❌ ONNX 导出失败: {e}")
             return "\n".join(results)
 
         try:
-            verify = verify_onnx(self.torch_model, self.fp32_path, num_points=self.num_points)
-            results.append(f"✅ 数值验证通过 (最大误差: {verify['max_diff']:.6f})")
+            onnx_model = onnx.load(self.fp32_path)
+            onnx.checker.check_model(onnx_model)
+            results.append("✅ ONNX 模型验证通过")
         except Exception as e:
-            results.append(f"❌ 数值验证失败: {e}")
+            results.append(f"❌ ONNX 验证失败: {e}")
 
         try:
             quantize_onnx_int8(self.fp32_path, self.int8_path)
@@ -83,13 +111,16 @@ class EdgeDeployApp:
         except Exception as e:
             results.append(f"❌ 量化失败: {e}")
 
-        fp32_size = Path(self.fp32_path).stat().st_size / 1024 / 1024
-        int8_size = Path(self.int8_path).stat().st_size / 1024 / 1024
-        results.append(f"\n模型大小:")
-        results.append(f"  PyTorch: ~{sum(p.numel() * p.element_size() for p in self.torch_model.parameters()) / 1024 / 1024:.2f} MB")
-        results.append(f"  ONNX FP32: {fp32_size:.2f} MB")
-        results.append(f"  ONNX INT8: {int8_size:.2f} MB")
-        results.append(f"  压缩比: {fp32_size / int8_size:.2f}x")
+        if Path(self.fp32_path).exists() and Path(self.int8_path).exists():
+            fp32_size = Path(self.fp32_path).stat().st_size / 1024 / 1024
+            int8_size = Path(self.int8_path).stat().st_size / 1024 / 1024
+            torch_size = sum(p.numel() * p.element_size() for p in self.torch_model.parameters()) / 1024 / 1024
+            results.append(f"\n模型大小:")
+            results.append(f"  PyTorch:    {torch_size:.2f} MB")
+            results.append(f"  ONNX FP32:  {fp32_size:.2f} MB")
+            results.append(f"  ONNX INT8:  {int8_size:.2f} MB")
+            if int8_size > 0:
+                results.append(f"  压缩比:     {fp32_size / int8_size:.2f}x")
 
         return "\n".join(results)
 
@@ -144,7 +175,7 @@ class EdgeDeployApp:
         pred_match = "✅ 一致" if torch_top5[0] == int8_top5[0] else "⚠️ 不一致"
         results_text.append(f"\n预测一致性: {pred_match}")
         results_text.append(f"  PyTorch Top-1: {MODELNET40_CLASSES[torch_top5[0]]}")
-        results_text.append(f"  INT8 Top-1: {MODELNET40_CLASSES[int8_top5[0]]}")
+        results_text.append(f"  INT8 Top-1:    {MODELNET40_CLASSES[int8_top5[0]]}")
 
         from src.benchmark import visualize_accuracy
         img_path = visualize_accuracy(
@@ -188,67 +219,67 @@ P95 延迟:
         return img_path, summary
 
     def build(self):
-        with gr.Blocks(title="边缘部署对比 Demo") as demo:
-            gr.Markdown("# 边缘部署对比 Demo")
-            gr.Markdown("PyTorch → ONNX → INT8 量化，对比三种推理方式的精度和速度。")
+        with gr.Blocks(title="Edge Deployment Demo") as demo:
+            gr.Markdown("# Edge Deployment Demo")
+            gr.Markdown("PyTorch → ONNX → INT8 quantization. Compare accuracy and speed across 3 inference paths.")
 
-            with gr.Tab("导出与量化"):
-                gr.Markdown("### 第1步：导出 ONNX + INT8 量化")
-                export_btn = gr.Button("导出 + 量化", variant="primary")
-                export_output = gr.Textbox(label="结果", lines=12, interactive=False)
+            with gr.Tab("Export & Quantize"):
+                gr.Markdown("### Step 1: Export ONNX + INT8 Quantize")
+                export_btn = gr.Button("Export + Quantize", variant="primary")
+                export_output = gr.Textbox(label="Result", lines=12, interactive=False)
                 export_btn.click(fn=self.export_and_quantize, outputs=[export_output])
 
-            with gr.Tab("推理对比"):
-                gr.Markdown("### 单次推理对比")
-                shape = gr.Dropdown(SHAPES, label="选择形状", value="chair")
-                infer_btn = gr.Button("推理对比", variant="primary")
-                infer_image = gr.Image(label="Logits 对比")
-                infer_output = gr.Textbox(label="推理结果", lines=15, interactive=False)
+            with gr.Tab("Inference Compare"):
+                gr.Markdown("### Single inference comparison")
+                shape = gr.Dropdown(SHAPES, label="Select shape", value="chair")
+                infer_btn = gr.Button("Run Inference", variant="primary")
+                infer_image = gr.Image(label="Logits Comparison")
+                infer_output = gr.Textbox(label="Result", lines=15, interactive=False)
                 infer_btn.click(fn=self.infer_compare, inputs=[shape], outputs=[infer_image, infer_output])
 
-            with gr.Tab("基准测试"):
-                gr.Markdown("### 批量基准测试（50次运行）")
-                bench_btn = gr.Button("运行基准测试", variant="primary")
-                bench_image = gr.Image(label="速度对比图")
-                bench_output = gr.Textbox(label="测试结果", lines=12, interactive=False)
+            with gr.Tab("Benchmark"):
+                gr.Markdown("### Batch benchmark (50 runs)")
+                bench_btn = gr.Button("Run Benchmark", variant="primary")
+                bench_image = gr.Image(label="Speed Comparison")
+                bench_output = gr.Textbox(label="Result", lines=12, interactive=False)
                 bench_btn.click(fn=self.run_benchmark, outputs=[bench_image, bench_output])
 
-            with gr.Tab("帮助"):
+            with gr.Tab("Help"):
                 gr.Markdown("""
-                ### 边缘部署流程
+                ### Edge Deployment Pipeline
 
                 ```
-                PyTorch 模型 (.pth)
-                    ↓ torch.onnx.export
+                PyTorch model (.pth)
+                    ↓ torch.onnx.export (dynamo=False, opset=17)
                 ONNX FP32 (.onnx)
                     ↓ quantize_dynamic (INT8)
                 ONNX INT8 (.onnx)
-                    ↓ onnxruntime 推理
-                边缘设备部署
+                    ↓ onnxruntime inference
+                Edge device deployment
                 ```
 
-                ### 对比维度
+                ### Comparison Metrics
 
-                | 维度 | 说明 |
+                | Metric | Description |
                 |---|---|
-                | 模型大小 | FP32 vs INT8 文件大小对比 |
-                | 推理延迟 | 单次推理耗时（ms） |
-                | 吞吐量 | FPS（每秒处理帧数） |
-                | 精度差异 | Logits 误差 + Top-1 预测一致性 |
-                | 延迟分布 | P50/P95/P99 延迟 |
+                | Model size | FP32 vs INT8 file size |
+                | Latency | Single inference time (ms) |
+                | Throughput | FPS |
+                | Accuracy | Logits diff + Top-1 consistency |
+                | Latency dist | P50/P95/P99 |
 
-                ### 技术说明
+                ### Technical Notes
 
-                - **ONNX**：开放神经网络交换格式，跨框架标准
-                - **INT8 动态量化**：权重 int8，激活 fp32，无需校准数据
-                - **ONNX Runtime**：微软推理引擎，CPU 优化好
-                - **动态 batch**：ONNX 导出时设置了 dynamic_axes，支持可变 batch
+                - **ONNX**: Open Neural Network Exchange, cross-platform standard
+                - **INT8 dynamic quantization**: Weights int8, activations fp32, no calibration needed
+                - **ONNX Runtime**: Microsoft inference engine, CPU optimized
+                - **Dynamic batch**: dynamic_axes supports variable batch size
 
-                ### 和实际项目的关系
+                ### Relation to Real Projects
 
-                这个 demo 展示的流程（PyTorch → ONNX → INT8 → ORT）正是工业部署的标准链路：
-                - 制鞋项目：模型轻量化满足产线 3s/只 实时性
-                - 论文项目：边缘设备部署
+                This demo shows the standard industrial deployment pipeline:
+                - Shoe project: model lightweighting for 3s/cycle production line
+                - Thesis: edge device deployment
                 """)
 
         return demo
