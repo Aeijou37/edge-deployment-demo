@@ -107,8 +107,8 @@ def visualize_benchmark(benchmark_results: Dict, output_path: str = "output_benc
 
     avgs = [benchmark_results[k]["avg_ms"] for k in keys]
     bars = axes[0].bar(names, avgs, color=colors)
-    axes[0].set_ylabel("平均延迟 (ms)")
-    axes[0].set_title("平均推理延迟")
+    axes[0].set_ylabel("Avg Latency (ms)")
+    axes[0].set_title("Average Inference Latency")
     for bar, val in zip(bars, avgs):
         axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
                      f"{val:.2f}ms", ha="center", fontsize=10)
@@ -116,7 +116,7 @@ def visualize_benchmark(benchmark_results: Dict, output_path: str = "output_benc
     fpses = [benchmark_results[k]["fps"] for k in keys]
     bars = axes[1].bar(names, fpses, color=colors)
     axes[1].set_ylabel("FPS")
-    axes[1].set_title("吞吐量 (FPS)")
+    axes[1].set_title("Throughput (FPS)")
     for bar, val in zip(bars, fpses):
         axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
                      f"{val:.0f}", ha="center", fontsize=10)
@@ -126,8 +126,8 @@ def visualize_benchmark(benchmark_results: Dict, output_path: str = "output_benc
     for patch, color in zip(bp["boxes"], colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.7)
-    axes[2].set_ylabel("延迟 (ms)")
-    axes[2].set_title("延迟分布")
+    axes[2].set_ylabel("Latency (ms)")
+    axes[2].set_title("Latency Distribution")
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
